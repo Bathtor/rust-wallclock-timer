@@ -50,27 +50,27 @@ pub trait WallClockTimer {
     fn cancel(&mut self, id: &Self::Id);
 }
 
-/// A timeout state for a one-shot timer using a closure as the triggering action.
-pub struct OneShotClosureState<I> {
+/// A timeout state for a timer using a closure as the triggering action.
+pub struct ClosureState<I> {
     id: I,
     action: Box<dyn FnOnce(I) + Send + 'static>,
 }
 
-impl<I> OneShotClosureState<I> {
+impl<I> ClosureState<I> {
     /// Produces a new instance of this state type
     /// from a unique id and the action to be executed when it expires.
     pub fn new<F>(id: I, action: F) -> Self
     where
         F: FnOnce(I) + Send + 'static,
     {
-        OneShotClosureState {
+        ClosureState {
             id,
             action: Box::new(action),
         }
     }
 }
 
-impl<I> State for OneShotClosureState<I>
+impl<I> State for ClosureState<I>
 where
     I: Hash + Clone + Eq,
 {
@@ -85,7 +85,7 @@ where
     }
 }
 
-impl<I> fmt::Debug for OneShotClosureState<I>
+impl<I> fmt::Debug for ClosureState<I>
 where
     I: Hash + Clone + Eq + fmt::Debug,
 {
@@ -109,12 +109,12 @@ pub trait ClosureTimer: WallClockTimer {
 impl<I, T> ClosureTimer for T
 where
     I: Hash + Clone + Eq,
-    T: WallClockTimer<Id = I, State = OneShotClosureState<I>>,
+    T: WallClockTimer<Id = I, State = ClosureState<I>>,
 {
     fn schedule_action_at<F>(&mut self, id: Self::Id, deadline: std::time::SystemTime, action: F)
     where
         F: FnOnce(Self::Id) + Send + 'static,
     {
-        self.schedule_at(deadline, OneShotClosureState::new(id, action))
+        self.schedule_at(deadline, ClosureState::new(id, action))
     }
 }
