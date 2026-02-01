@@ -334,6 +334,10 @@ where
     fn run(mut self) {
         'run_loop: while self.running {
             let now = self.clock.now();
+            // eprintln!(
+            //     "Checking run loop at {now:?}. State: running={}, entry_queue={:?}, entries={:?}",
+            //     self.running, self.entry_queue, self.entries
+            // );
             self.process_due(now);
             if !self.running {
                 break 'run_loop;
@@ -440,8 +444,11 @@ where
                 return None;
             }
             let entry = self.entry_queue.pop().expect("peeked entry");
-            let scheduled = self.entries.remove(&entry.id).expect("entry should exist");
-            Some(scheduled)
+            let scheduled = self.entries.remove(&entry.id);
+            if scheduled.is_none() {
+                log::debug!("Skipping entry {entry:?}, because it always already cancelled.");
+            }
+            scheduled
         } else {
             None
         }
@@ -452,17 +459,21 @@ where
 mod tests {
     use super::*;
     use crate::timers::ClosureTimer;
-    use std::sync::{
-        Arc,
-        Mutex,
-        Once,
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    use std::{
+        sync::{
+            Arc,
+            Mutex,
+            Once,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+        time::Instant,
     };
 
     fn init_logger() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             let _ = simple_logger::SimpleLogger::new().init();
+            log::set_max_level(log::LevelFilter::Debug);
         });
     }
 
@@ -495,10 +506,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct AtomicCounter {
+        inner: Arc<AtomicUsize>,
+    }
+
+    impl AtomicCounter {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn increment(&self) {
+            self.inner.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+
+        fn get(&self) -> usize {
+            self.inner.load(AtomicOrdering::SeqCst)
+        }
+    }
+
     #[derive(Debug)]
     struct TestState {
         id: u64,
-        hits: Arc<AtomicUsize>,
+        hits: AtomicCounter,
     }
 
     impl State for TestState {
@@ -509,173 +541,241 @@ mod tests {
         }
 
         fn trigger(self) {
-            self.hits.fetch_add(1, AtomicOrdering::SeqCst);
+            self.hits.increment();
         }
     }
 
     #[test]
     fn mock_clock_triggers_on_deadline() {
         init_logger();
-        let (s, r) = channel::unbounded();
-        let mut timer = ThreadTimer::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = Arc::new(AtomicUsize::new(0));
+        let timer = TimerWithThread::<u64, TestState>::new_with_clock(
+            clock.clone(),
+            Duration::from_millis(5),
+        )
+        .expect("timer");
+        let mut tref = timer.timer_ref();
+        let hits = AtomicCounter::new();
+        let hits2 = AtomicCounter::new();
 
-        let entry = TimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-            state: TestState {
+        let deadline = SystemTime::UNIX_EPOCH + Duration::from_millis(5);
+        tref.schedule_at(
+            deadline,
+            TestState {
                 id: 1,
                 hits: hits.clone(),
             },
-        };
-        let later_entry = TimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
-            state: TestState {
+        )
+        .expect("schedule");
+
+        let later_deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        tref.schedule_at(
+            later_deadline,
+            TestState {
                 id: 2,
                 hits: hits2.clone(),
             },
-        };
+        )
+        .expect("schedule");
 
-        s.send(TimerMsg::Schedule(entry)).expect("send");
-        s.send(TimerMsg::Schedule(later_entry)).expect("send");
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        // Wait a good bit longer than the initial timeout to ensure it's properly controlled by
+        // the clock.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
-        clock.advance(Duration::from_secs(6));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        clock.advance(Duration::from_millis(6));
+        wait_for_hits(&hits, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 0);
+
+        clock.advance(Duration::from_secs(20));
+        wait_for_hits(&hits2, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 1);
+
+        timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn wake_on_message_while_waiting_long_timeout() {
         init_logger();
-        let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new().expect("timer");
+        let timer = TimerWithThread::<u64, TestState>::default();
         let mut tref = timer.timer_ref();
 
-        let far_deadline = SystemTime::now() + Duration::from_secs(60);
-        tref.schedule_action_at(1, far_deadline, |_| {})
-            .expect("schedule");
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_clone = hits.clone();
-        let near_deadline = SystemTime::now() + Duration::from_millis(50);
-        tref.schedule_action_at(2, near_deadline, move |_| {
-            hits_clone.fetch_add(1, AtomicOrdering::SeqCst);
-        })
+        let far_hits = AtomicCounter::new();
+        let far_deadline = SystemTime::now() + Duration::from_hours(1000);
+        tref.schedule_at(
+            far_deadline,
+            TestState {
+                id: 1,
+                hits: far_hits.clone(),
+            },
+        )
         .expect("schedule");
 
-        let start = std::time::Instant::now();
-        'wait_loop: while start.elapsed() < Duration::from_secs(2) {
-            if hits.load(AtomicOrdering::SeqCst) > 0 {
-                break 'wait_loop;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        // Wait a bit so the thread can go to sleep on the listening channel.
+        thread::sleep(Duration::from_millis(5));
 
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        let near_hits = AtomicCounter::new();
+        let near_deadline = SystemTime::now() + Duration::from_millis(50);
+        tref.schedule_at(
+            near_deadline,
+            TestState {
+                id: 2,
+                hits: near_hits.clone(),
+            },
+        )
+        .expect("schedule");
+
+        wait_for_hits(&near_hits, 1, Duration::from_secs(2));
+        assert_eq!(near_hits.get(), 1);
+        assert_eq!(far_hits.get(), 0);
+
         timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn time_jump_forward_triggers_immediately() {
         init_logger();
-        let (s, r) = channel::unbounded();
-        let mut timer = TimerThread::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = Arc::new(AtomicUsize::new(0));
+        let timer = TimerWithThread::<u64, TestState>::new_with_clock(
+            clock.clone(),
+            Duration::from_millis(5),
+        )
+        .expect("timer");
+        let mut tref = timer.timer_ref();
+        let hits = AtomicCounter::new();
+        let hits2 = AtomicCounter::new();
 
-        let entry = WallClockTimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
-            state: TestState {
-                id: 7,
+        let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let far_deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(90);
+        tref.schedule_at(
+            deadline,
+            TestState {
+                id: 1,
                 hits: hits.clone(),
             },
-        };
-        let far_entry = WallClockTimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(90),
-            state: TestState {
-                id: 8,
+        )
+        .expect("schedule");
+        tref.schedule_at(
+            far_deadline,
+            TestState {
+                id: 2,
                 hits: hits2.clone(),
             },
-        };
-        s.send(TimerMsg::Schedule(entry)).expect("send");
-        s.send(TimerMsg::Schedule(far_entry)).expect("send");
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        )
+        .expect("schedule");
+
+        // Wait to ensure nothing gets triggered without advancing the clock.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
         clock.advance(Duration::from_secs(30));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        wait_for_hits(&hits, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 0);
+
+        clock.advance(Duration::from_secs(100));
+        wait_for_hits(&hits2, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 1);
+
+        timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn time_jump_backward_does_not_trigger_early() {
         init_logger();
-        let (s, r) = channel::unbounded();
-        let mut timer = TimerThread::<u64, TestState>::new(r);
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let clock = MockClock::new(start);
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = Arc::new(AtomicUsize::new(0));
+        let timer = TimerWithThread::<u64, TestState>::new_with_clock(
+            clock.clone(),
+            Duration::from_millis(5),
+        )
+        .expect("timer");
+        let mut tref = timer.timer_ref();
+        let hits = AtomicCounter::new();
+        let hits2 = AtomicCounter::new();
 
-        let entry = WallClockTimerEntry {
-            deadline: start + Duration::from_secs(10),
-            state: TestState {
-                id: 9,
+        // Essentially 110
+        let deadline = start + Duration::from_secs(10);
+        // Essentially 140
+        let later_deadline = start + Duration::from_secs(40);
+        tref.schedule_at(
+            deadline,
+            TestState {
+                id: 1,
                 hits: hits.clone(),
             },
-        };
-        let later_entry = WallClockTimerEntry {
-            deadline: start + Duration::from_secs(40),
-            state: TestState {
-                id: 10,
+        )
+        .expect("schedule");
+        tref.schedule_at(
+            later_deadline,
+            TestState {
+                id: 2,
                 hits: hits2.clone(),
             },
-        };
-        s.send(TimerMsg::Schedule(entry)).expect("send");
-        s.send(TimerMsg::Schedule(later_entry)).expect("send");
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        )
+        .expect("schedule");
 
+        // Wait to ensure nothing gets triggered without advancing the clock.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
+
+        // Jump the clock backwards (to 70)
         clock.set(start - Duration::from_secs(30));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        // Wait a bit for the test thread to wake up and check the clock.
+        thread::sleep(Duration::from_millis(20));
+        // Nothing should have gotten triggered.
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
-        clock.set(start + Duration::from_secs(11));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        // Advance forward again (to 90)
+        clock.advance(Duration::from_secs(20));
+        // Wait a bit for the test thread to wake up and check the clock.
+        thread::sleep(Duration::from_millis(20));
+        // Nothing should have gotten triggered.
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
-        clock.set(start + Duration::from_secs(41));
-        timer.step(&clock);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 1);
+        // Advance forward again past the first deadline (to 111)
+        clock.advance(Duration::from_secs(21));
+        wait_for_hits(&hits, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 0);
+
+        // Advance forward past the second deadline (to 142)
+        clock.advance(Duration::from_secs(31));
+        wait_for_hits(&hits2, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 1);
+
+        timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn closure_timer_schedules_actions() {
         init_logger();
-        let (s, r) = channel::unbounded();
-        let mut timer = TimerThread::<u64, crate::timers::ClosureState<u64>>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
+        let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new_with_clock(
+            clock.clone(),
+            Duration::from_millis(5),
+        )
+        .expect("timer");
+        let mut tref = timer.timer_ref();
 
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = Arc::new(AtomicUsize::new(0));
+        let hits = AtomicCounter::new();
+        let hits2 = AtomicCounter::new();
 
-        let mut tref = TimerRef { work_queue: s };
         let hits_clone = hits.clone();
         tref.schedule_action_at(
             1,
             SystemTime::UNIX_EPOCH + Duration::from_secs(5),
             move |_| {
-                hits_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                hits_clone.increment();
             },
         )
         .expect("schedule");
@@ -684,71 +784,99 @@ mod tests {
             2,
             SystemTime::UNIX_EPOCH + Duration::from_secs(50),
             move |_| {
-                hits2_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                hits2_clone.increment();
             },
         )
         .expect("schedule");
 
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
         clock.advance(Duration::from_secs(10));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        wait_for_hits(&hits, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 1);
+        assert_eq!(hits2.get(), 0);
 
         clock.advance(Duration::from_secs(50));
-        timer.step(&clock);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 1);
+        wait_for_hits(&hits2, 1, Duration::from_secs(2));
+        assert_eq!(hits2.get(), 1);
+        timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn cancel_prevents_overdue_trigger_with_multiple_timers() {
         init_logger();
-        let (s, r) = channel::unbounded();
-        let mut timer = TimerThread::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = Arc::new(AtomicUsize::new(0));
+        let timer = TimerWithThread::<u64, TestState>::new_with_clock(
+            clock.clone(),
+            Duration::from_millis(5),
+        )
+        .expect("timer");
+        let mut tref = timer.timer_ref();
+        let hits = AtomicCounter::new();
+        let hits2 = AtomicCounter::new();
 
-        let entry = WallClockTimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-            state: TestState {
-                id: 100,
+        let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        tref.schedule_at(
+            deadline,
+            TestState {
+                id: 1,
                 hits: hits.clone(),
             },
-        };
-        let entry2 = WallClockTimerEntry {
-            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-            state: TestState {
-                id: 101,
+        )
+        .expect("schedule");
+        tref.schedule_at(
+            deadline,
+            TestState {
+                id: 2,
                 hits: hits2.clone(),
             },
-        };
+        )
+        .expect("schedule");
 
-        s.send(TimerMsg::Schedule(entry)).expect("send");
-        s.send(TimerMsg::Schedule(entry2)).expect("send");
-        s.send(TimerMsg::Cancel(101)).expect("send");
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        // Wait a bit for things to get scheduled.
+        thread::sleep(Duration::from_millis(20));
+
+        tref.cancel(1).expect("cancel");
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 0);
 
         clock.advance(Duration::from_secs(6));
-        timer.step(&clock);
-        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+        wait_for_hits(&hits2, 1, Duration::from_secs(2));
+        assert_eq!(hits.get(), 0);
+        assert_eq!(hits2.get(), 1);
+
+        timer.shutdown().expect("shutdown");
     }
 
     #[test]
     fn join_thread_error_from_panicking_handler() {
         init_logger();
-        let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new().expect("timer");
+        let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new(DEFAULT_MAX_WAIT)
+            .expect("timer");
         let mut tref = timer.timer_ref();
         tref.schedule_action_at(1, SystemTime::now(), |_| panic!("boom"))
             .expect("schedule");
         thread::sleep(Duration::from_millis(10));
-        let err = timer.shutdown().expect_err("expected join error");
-        assert_eq!(err, ThreadTimerError::JoinThread);
+        let err = timer.shutdown().expect_err("expected shutdown error");
+        // Depending on time it may either throw while trying to send the shutdown or while waiting for it.
+        const POSSIBLE_ERRORS: [ThreadTimerError; 2] =
+            [ThreadTimerError::JoinThread, ThreadTimerError::SendMessage];
+        assert!(
+            POSSIBLE_ERRORS.contains(&err),
+            "Should have gotten a shutdown error but was: {err}"
+        );
+    }
+
+    fn wait_for_hits(hits: &AtomicCounter, expected: usize, timeout: Duration) {
+        let start = Instant::now();
+        'wait_loop: while start.elapsed() < timeout {
+            if hits.get() >= expected {
+                break 'wait_loop;
+            }
+            thread::yield_now();
+        }
     }
 }
