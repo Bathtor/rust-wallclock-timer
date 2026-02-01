@@ -7,8 +7,8 @@
 //!
 //! # Quick start (UUID ids)
 //! ```no_run
-//! use rust_wallclock_timer::thread_timer::UuidClosureTimer;
-//! use rust_wallclock_timer::ClosureTimer;
+//! use wallclock_timer::thread_timer::UuidClosureTimer;
+//! use wallclock_timer::ClosureTimer;
 //! use std::time::{Duration, SystemTime};
 //! use uuid::Uuid;
 //!
