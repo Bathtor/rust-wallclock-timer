@@ -1,11 +1,18 @@
 //! Timer implementation that runs on its own thread and uses wall-clock deadlines.
+//!
+//! This module emits errors via the `log` crate. Provide a logger implementation
+//! in your application to see these messages.
 
-use crate::timers::{State, WallClockTimer, WallClockTimerEntry};
+use crate::{
+    ClosureState,
+    timers::{State, WallClockTimer},
+};
 use crossbeam_channel as channel;
 use rustc_hash::FxHashMap;
+use snafu::{ResultExt, Snafu};
 use std::{
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, hash_map},
     fmt,
     hash::Hash,
     thread,
@@ -28,21 +35,50 @@ impl Clock for RealClock {
     }
 }
 
+/// Errors returned by the thread timer APIs.
+#[derive(Debug, Snafu)]
+pub enum ThreadTimerError {
+    /// Failed to spawn the timer thread.
+    #[snafu(display("Failed to spawn timer thread: {source}"))]
+    SpawnThread { source: std::io::Error },
+    /// Failed to send a message to the timer thread.
+    #[snafu(display("Failed to send message to timer thread"))]
+    SendMessage,
+    /// Timer thread panicked while running.
+    #[snafu(display("Timer thread panicked while waiting to join"))]
+    JoinThread,
+}
+
+impl PartialEq for ThreadTimerError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ThreadTimerError::SpawnThread { .. }, _)
+            | (_, ThreadTimerError::SpawnThread { .. }) => false,
+            (ThreadTimerError::SendMessage, ThreadTimerError::SendMessage) => true,
+            (ThreadTimerError::JoinThread, ThreadTimerError::JoinThread) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TimerMsg<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
-    Schedule(WallClockTimerEntry<I, O>),
+    Schedule(TimerEntry<I, O>),
     Cancel(I),
     Stop,
 }
 
+/// A shorthand for a reference to a [[ThreadTimer]] with closure actions.
+pub type ClosureTimerRef<I> = TimerRef<I, ClosureState<I>>;
+
 /// A reference to a thread timer.
 pub struct TimerRef<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
     work_queue: channel::Sender<TimerMsg<I, O>>,
@@ -50,29 +86,39 @@ where
 
 impl<I, O> WallClockTimer for TimerRef<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
     type Id = I;
     type State = O;
+    type Error = ThreadTimerError;
 
-    fn schedule_at(&mut self, deadline: SystemTime, state: Self::State) {
-        let entry = WallClockTimerEntry { deadline, state };
+    fn schedule_at(
+        &mut self,
+        deadline: SystemTime,
+        state: Self::State,
+    ) -> Result<(), ThreadTimerError> {
+        let entry = TimerEntry { deadline, state };
         self.work_queue
             .send(TimerMsg::Schedule(entry))
-            .unwrap_or_else(|e| eprintln!("Could not send Schedule msg: {:?}", e));
+            .map_err(|err| {
+                log::error!("Failed to send schedule message: {}", err);
+                ThreadTimerError::SendMessage
+            })
     }
 
-    fn cancel(&mut self, id: &Self::Id) {
-        self.work_queue
-            .send(TimerMsg::Cancel(id.clone()))
-            .unwrap_or_else(|e| eprintln!("Could not send Cancel msg: {:?}", e));
+    fn cancel(&mut self, id: Self::Id) -> Result<(), ThreadTimerError> {
+        self.work_queue.send(TimerMsg::Cancel(id)).map_err(|err| {
+            log::error!("Failed to send cancel message: {}", err);
+            ThreadTimerError::SendMessage
+        })
     }
 }
 
+// Explicit Clone implementation, because O does not need to be Clone for the [[TimerRef]] to be Clone.
 impl<I, O> Clone for TimerRef<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
     fn clone(&self) -> Self {
@@ -82,10 +128,16 @@ where
     }
 }
 
+/// Default value for [[TimerWithThread::new]] `max_wait_time` argument.
+pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
+
 /// A timer implementation that uses its own thread.
+///
+/// This instance is essentially the owning handle.
+/// Non-owning references can be created with [[TimeWithThread::timer_ref()]] and are always cloneable.
 pub struct TimerWithThread<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
     timer_thread: thread::JoinHandle<()>,
@@ -94,16 +146,28 @@ where
 
 impl<I, O> TimerWithThread<I, O>
 where
-    I: Hash + Clone + Eq + fmt::Debug + Send + 'static,
+    I: Hash + Clone + Eq + Ord + fmt::Debug + Send + 'static,
     O: State<Id = I> + fmt::Debug + Send + 'static,
 {
     /// Create a new timer with its own thread.
-    pub fn new() -> std::io::Result<TimerWithThread<I, O>> {
-        Self::new_with_clock(RealClock)
+    ///
+    /// `max_wait_time` is the maximum time we wait until we check the clock again,
+    /// in case it jumped (e.g. after sleep or due to a timezone change).
+    pub fn new(max_wait_time: Duration) -> Result<TimerWithThread<I, O>, ThreadTimerError> {
+        Self::new_with_clock(RealClock, max_wait_time)
     }
 
     /// Create a new timer with its own thread using a custom clock.
-    pub fn new_with_clock<C>(clock: C) -> std::io::Result<TimerWithThread<I, O>>
+    ///
+    /// This is mostly meant for testing, but can also be used to supply other clock sources
+    /// than [[SystemTime]].
+    ///
+    /// `max_wait_time` is the maximum time we wait until we check the clock again,
+    /// in case it jumped (e.g. after sleep or due to a timezone change).
+    pub fn new_with_clock<C>(
+        clock: C,
+        max_wait_time: Duration,
+    ) -> Result<TimerWithThread<I, O>, ThreadTimerError>
     where
         C: Clock,
     {
@@ -111,9 +175,10 @@ where
         let handle = thread::Builder::new()
             .name("wallclock-timer-thread".to_string())
             .spawn(move || {
-                let timer = TimerThread::new(r);
-                timer.run_with_clock(clock);
-            })?;
+                let timer = TimerThread::new(r, clock, max_wait_time);
+                timer.run();
+            })
+            .context(SpawnThreadSnafu)?;
         Ok(TimerWithThread {
             timer_thread: handle,
             work_queue: s,
@@ -129,27 +194,36 @@ where
 
     /// Shut this timer down and wait for the thread to join.
     pub fn shutdown(self) -> Result<(), ThreadTimerError> {
-        self.work_queue
-            .send(TimerMsg::Stop)
-            .unwrap_or_else(|e| eprintln!("Could not send Stop msg: {:?}", e));
-        match self.timer_thread.join() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(ThreadTimerError::CouldNotJoinThread),
+        if let Err(send_err) = self.work_queue.send(TimerMsg::Stop) {
+            log::error!("Failed to send stop message: {}", send_err);
+            // We can't be sure the time_thread will ever finish.
+            if self.timer_thread.is_finished() {
+                // But if it did, we can print the error message.
+                if self.timer_thread.join().is_err() {
+                    log::error!("The timer thread panicked. See stderr for more information.");
+                }
+            } // Otherwise we'll just leak it, rather than risking blocking this thread as well.
+            SendMessageSnafu.fail()
+        } else {
+            self.timer_thread.join().map_err(|_| {
+                log::error!("The timer thread panicked. See stderr for more information.");
+                JoinThreadSnafu.build()
+            })
         }
     }
 
     /// Same as `shutdown`, but doesn't wait for the thread to join.
     pub fn shutdown_async(&self) -> Result<(), ThreadTimerError> {
-        self.work_queue
-            .send(TimerMsg::Stop)
-            .unwrap_or_else(|e| eprintln!("Could not send Stop msg: {:?}", e));
-        Ok(())
+        self.work_queue.send(TimerMsg::Stop).map_err(|err| {
+            log::error!("Failed to send stop message: {}", err);
+            SendMessageSnafu.build()
+        })
     }
 }
 
 impl<I, O> fmt::Debug for TimerWithThread<I, O>
 where
-    I: Hash + Clone + Eq,
+    I: Hash + Clone + Eq + Ord,
     O: State<Id = I>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,152 +231,196 @@ where
     }
 }
 
-/// Errors that can occur when stopping the timer thread.
-#[derive(Debug)]
-pub enum ThreadTimerError {
-    /// Joining of the timer thread failed.
-    CouldNotJoinThread,
-}
-
-#[derive(Debug)]
-struct ScheduledEntry<O> {
-    deadline: SystemTime,
-    generation: u64,
-    state: O,
-}
-
-#[derive(Debug)]
-struct HeapEntry<I> {
-    deadline: SystemTime,
-    generation: u64,
-    seq: u64,
-    id: I,
-}
-
-impl<I: Eq> PartialEq for HeapEntry<I> {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline
-            && self.generation == other.generation
-            && self.seq == other.seq
+impl<I, O> Default for TimerWithThread<I, O>
+where
+    I: Hash + Clone + Eq + Ord + fmt::Debug + Send + 'static,
+    O: State<Id = I> + fmt::Debug + Send + 'static,
+{
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_WAIT).expect("Failed to create default timer")
     }
 }
 
-impl<I: Eq> Eq for HeapEntry<I> {}
+#[derive(Debug, PartialEq, Eq)]
+struct HeapEntry<I> {
+    deadline: SystemTime,
+    id: I,
+}
 
-impl<I: Eq> PartialOrd for HeapEntry<I> {
+impl<I> PartialOrd for HeapEntry<I>
+where
+    I: Eq + Ord,
+{
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<I: Eq> Ord for HeapEntry<I> {
+impl<I> Ord for HeapEntry<I>
+where
+    I: Eq + Ord,
+{
     fn cmp(&self, other: &Self) -> Ordering {
-        match other.deadline.cmp(&self.deadline) {
-            Ordering::Equal => other.seq.cmp(&self.seq),
-            ord => ord,
-        }
+        // match other.deadline.cmp(&self.deadline) {
+        //     Ordering::Equal => other.sid.cmp(&self.id),
+        //     ord => ord,
+        // }
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 
-struct TimerThread<I, O>
+/// A concrete entry for an outstanding timeout using a wall-clock deadline.
+#[derive(Debug)]
+struct TimerEntry<I, O>
 where
-    I: Hash + Clone + Eq + fmt::Debug,
-    O: State<Id = I> + fmt::Debug,
+    I: Hash + Clone + Eq,
+    O: State<Id = I>,
 {
-    entry_queue: BinaryHeap<HeapEntry<I>>,
-    entries: FxHashMap<I, ScheduledEntry<O>>,
-    work_queue: channel::Receiver<TimerMsg<I, O>>,
-    running: bool,
-    next_generation: u64,
-    next_seq: u64,
+    /// The wall clock deadline at which this should trigger.
+    pub deadline: SystemTime,
+    /// The information to store along with the timer.
+    pub state: O,
 }
 
-impl<I, O> TimerThread<I, O>
+impl<I, O> TimerEntry<I, O>
 where
-    I: Hash + Clone + Eq + fmt::Debug,
-    O: State<Id = I> + fmt::Debug,
+    I: Hash + Clone + Eq,
+    O: State<Id = I>,
 {
-    fn new(work_queue: channel::Receiver<TimerMsg<I, O>>) -> Self {
+    /// A reference to the id associated with this entry.
+    pub fn id(&self) -> &I {
+        self.state.id()
+    }
+}
+
+struct TimerThread<I, O, C>
+where
+    I: Hash + Clone + Eq + Ord + fmt::Debug,
+    O: State<Id = I> + fmt::Debug,
+    C: Clock + Send + 'static,
+{
+    entry_queue: BinaryHeap<HeapEntry<I>>,
+    entries: FxHashMap<I, TimerEntry<I, O>>,
+    work_queue: channel::Receiver<TimerMsg<I, O>>,
+    running: bool,
+    clock: C,
+    max_wait_time: Duration,
+}
+
+impl<I, O, C> TimerThread<I, O, C>
+where
+    I: Hash + Clone + Eq + Ord + fmt::Debug,
+    O: State<Id = I> + fmt::Debug,
+    C: Clock + Send + 'static,
+{
+    fn new(
+        work_queue: channel::Receiver<TimerMsg<I, O>>,
+        clock: C,
+        max_wait_time: Duration,
+    ) -> Self {
         TimerThread {
             entry_queue: BinaryHeap::new(),
             entries: FxHashMap::default(),
             work_queue,
             running: true,
-            next_generation: 0,
-            next_seq: 0,
+            clock,
+            max_wait_time,
         }
     }
 
-    fn run_with_clock<C: Clock>(mut self, clock: C) {
+    fn run(mut self) {
         'run_loop: while self.running {
-            self.process_due(clock.now());
+            let now = self.clock.now();
+            self.process_due(now);
             if !self.running {
                 break 'run_loop;
             }
 
-            let next_deadline = self.next_deadline();
-            match next_deadline {
+            match self.next_deadline() {
                 None => match self.work_queue.recv() {
-                    Ok(msg) => self.handle_msg(msg, &clock),
-                    Err(channel::RecvError) => break 'run_loop,
+                    Ok(msg) => self.handle_msg(msg),
+                    Err(channel::RecvError) => {
+                        log::error!("Channel died, stopping timer thread...");
+                        break 'run_loop;
+                    }
                 },
                 Some(deadline) => {
-                    let now = clock.now();
                     if deadline <= now {
                         continue 'run_loop;
                     }
+                    // Take a new reading of the clock, since some time could have passed processing the due entries.
                     let wait = deadline
-                        .duration_since(now)
-                        .unwrap_or(Duration::from_millis(0));
+                        .duration_since(self.clock.now())
+                        .unwrap_or(Duration::ZERO)
+                        .min(self.max_wait_time);
                     match self.work_queue.recv_timeout(wait) {
-                        Ok(msg) => self.handle_msg(msg, &clock),
-                        Err(channel::RecvTimeoutError::Timeout) => (),
-                        Err(channel::RecvTimeoutError::Disconnected) => break 'run_loop,
+                        Ok(msg) => self.handle_msg(msg),
+                        Err(channel::RecvTimeoutError::Timeout) => {
+                            continue 'run_loop;
+                        }
+                        Err(channel::RecvTimeoutError::Disconnected) => {
+                            log::error!("Channel died, stopping timer thread...");
+                            break 'run_loop;
+                        }
                     }
                 }
             }
         }
     }
 
-    fn handle_msg<C: Clock>(&mut self, msg: TimerMsg<I, O>, clock: &C) {
+    fn handle_msg(&mut self, msg: TimerMsg<I, O>) {
         match msg {
-            TimerMsg::Stop => self.running = false,
-            TimerMsg::Schedule(entry) => self.schedule_entry(entry, clock),
-            TimerMsg::Cancel(id) => {
-                self.entries.remove(&id);
+            TimerMsg::Stop => {
+                log::info!("Timer thread received stop signal. Shutting down...");
+                self.running = false
             }
+            TimerMsg::Schedule(entry) => self.schedule_entry(entry),
+            TimerMsg::Cancel(id) => match self.entries.remove(&id) {
+                Some(e) => {
+                    log::info!("Cancelled timer entry {e:?}");
+                }
+                None => {
+                    log::warn!(
+                        "Could not find timer entry with {id:?} to cancel. It might have expired already?"
+                    );
+                }
+            },
         }
     }
 
-    fn schedule_entry<C: Clock>(&mut self, entry: WallClockTimerEntry<I, O>, clock: &C) {
-        let now = clock.now();
+    fn schedule_entry(&mut self, entry: TimerEntry<I, O>) {
+        let now = self.clock.now();
         if entry.deadline <= now {
+            log::debug!(
+                "Triggering entry with id {:?} instead of scheduling, since it's already expired.",
+                entry.id()
+            );
             entry.state.trigger();
             return;
         }
         let id = entry.id().clone();
-        self.insert_entry(id, entry.deadline, entry.state);
+        self.insert_entry(id, entry);
     }
 
-    fn insert_entry(&mut self, id: I, deadline: SystemTime, state: O) {
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1);
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.entries.insert(
-            id.clone(),
-            ScheduledEntry {
-                deadline,
-                generation,
-                state,
-            },
-        );
-        self.entry_queue.push(HeapEntry {
-            deadline,
-            generation,
-            seq,
-            id,
-        });
+    fn insert_entry(&mut self, id: I, entry: TimerEntry<I, O>) {
+        match self.entries.entry(id) {
+            hash_map::Entry::Occupied(e) => {
+                log::error!(
+                    "Attempted to re-insert a timer entry with an already existing id. Scheduled timer ids must be unique! Existing entry: {:?}, new entry: {:?}",
+                    e,
+                    entry
+                );
+            }
+            hash_map::Entry::Vacant(e) => {
+                let id = entry.id().clone();
+                let deadline = entry.deadline;
+                e.insert(entry);
+                self.entry_queue.push(HeapEntry { deadline, id });
+            }
+        }
     }
 
     fn process_due(&mut self, now: SystemTime) {
@@ -311,55 +429,22 @@ where
         }
     }
 
+    #[inline(always)]
     fn next_deadline(&mut self) -> Option<SystemTime> {
-        while let Some(top) = self.entry_queue.peek() {
-            let valid = self
-                .entries
-                .get(&top.id)
-                .map(|entry| entry.generation == top.generation && entry.deadline == top.deadline)
-                .unwrap_or(false);
-            if valid {
-                return Some(top.deadline);
-            }
-            self.entry_queue.pop();
-        }
-        None
+        self.entry_queue.peek().map(|entry| entry.deadline)
     }
 
-    fn pop_next_due(&mut self, now: SystemTime) -> Option<ScheduledEntry<O>> {
-        while let Some(top) = self.entry_queue.peek() {
-            let valid = self
-                .entries
-                .get(&top.id)
-                .map(|entry| entry.generation == top.generation && entry.deadline == top.deadline)
-                .unwrap_or(false);
-            if valid {
-                if top.deadline > now {
-                    return None;
-                }
-                let entry = self.entry_queue.pop().expect("peeked entry");
-                let scheduled = self.entries.remove(&entry.id).expect("entry should exist");
-                return Some(scheduled);
+    fn pop_next_due(&mut self, now: SystemTime) -> Option<TimerEntry<I, O>> {
+        if let Some(top) = self.entry_queue.peek() {
+            if top.deadline > now {
+                return None;
             }
-            self.entry_queue.pop();
+            let entry = self.entry_queue.pop().expect("peeked entry");
+            let scheduled = self.entries.remove(&entry.id).expect("entry should exist");
+            Some(scheduled)
+        } else {
+            None
         }
-        None
-    }
-
-    #[cfg(test)]
-    fn step<C: Clock>(&mut self, clock: &C) {
-        self.process_due(clock.now());
-        'recv_loop: loop {
-            match self.work_queue.try_recv() {
-                Ok(msg) => self.handle_msg(msg, clock),
-                Err(channel::TryRecvError::Empty) => break 'recv_loop,
-                Err(channel::TryRecvError::Disconnected) => {
-                    self.running = false;
-                    break 'recv_loop;
-                }
-            }
-        }
-        self.process_due(clock.now());
     }
 }
 
@@ -370,8 +455,16 @@ mod tests {
     use std::sync::{
         Arc,
         Mutex,
+        Once,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
+
+    fn init_logger() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = simple_logger::SimpleLogger::new().init();
+        });
+    }
 
     #[derive(Clone)]
     struct MockClock {
@@ -422,20 +515,21 @@ mod tests {
 
     #[test]
     fn mock_clock_triggers_on_deadline() {
+        init_logger();
         let (s, r) = channel::unbounded();
-        let mut timer = TimerThread::<u64, TestState>::new(r);
+        let mut timer = ThreadTimer::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
         let hits = Arc::new(AtomicUsize::new(0));
         let hits2 = Arc::new(AtomicUsize::new(0));
 
-        let entry = WallClockTimerEntry {
+        let entry = TimerEntry {
             deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
             state: TestState {
                 id: 1,
                 hits: hits.clone(),
             },
         };
-        let later_entry = WallClockTimerEntry {
+        let later_entry = TimerEntry {
             deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
             state: TestState {
                 id: 2,
@@ -457,18 +551,21 @@ mod tests {
 
     #[test]
     fn wake_on_message_while_waiting_long_timeout() {
+        init_logger();
         let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new().expect("timer");
         let mut tref = timer.timer_ref();
 
         let far_deadline = SystemTime::now() + Duration::from_secs(60);
-        tref.schedule_action_at(1, far_deadline, |_| {});
+        tref.schedule_action_at(1, far_deadline, |_| {})
+            .expect("schedule");
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
         let near_deadline = SystemTime::now() + Duration::from_millis(50);
         tref.schedule_action_at(2, near_deadline, move |_| {
             hits_clone.fetch_add(1, AtomicOrdering::SeqCst);
-        });
+        })
+        .expect("schedule");
 
         let start = std::time::Instant::now();
         'wait_loop: while start.elapsed() < Duration::from_secs(2) {
@@ -484,6 +581,7 @@ mod tests {
 
     #[test]
     fn time_jump_forward_triggers_immediately() {
+        init_logger();
         let (s, r) = channel::unbounded();
         let mut timer = TimerThread::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
@@ -518,6 +616,7 @@ mod tests {
 
     #[test]
     fn time_jump_backward_does_not_trigger_early() {
+        init_logger();
         let (s, r) = channel::unbounded();
         let mut timer = TimerThread::<u64, TestState>::new(r);
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
@@ -562,6 +661,7 @@ mod tests {
 
     #[test]
     fn closure_timer_schedules_actions() {
+        init_logger();
         let (s, r) = channel::unbounded();
         let mut timer = TimerThread::<u64, crate::timers::ClosureState<u64>>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
@@ -577,7 +677,8 @@ mod tests {
             move |_| {
                 hits_clone.fetch_add(1, AtomicOrdering::SeqCst);
             },
-        );
+        )
+        .expect("schedule");
         let hits2_clone = hits2.clone();
         tref.schedule_action_at(
             2,
@@ -585,7 +686,8 @@ mod tests {
             move |_| {
                 hits2_clone.fetch_add(1, AtomicOrdering::SeqCst);
             },
-        );
+        )
+        .expect("schedule");
 
         timer.step(&clock);
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
@@ -603,6 +705,7 @@ mod tests {
 
     #[test]
     fn cancel_prevents_overdue_trigger_with_multiple_timers() {
+        init_logger();
         let (s, r) = channel::unbounded();
         let mut timer = TimerThread::<u64, TestState>::new(r);
         let clock = MockClock::new(SystemTime::UNIX_EPOCH);
@@ -635,5 +738,17 @@ mod tests {
         timer.step(&clock);
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(hits2.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn join_thread_error_from_panicking_handler() {
+        init_logger();
+        let timer = TimerWithThread::<u64, crate::timers::ClosureState<u64>>::new().expect("timer");
+        let mut tref = timer.timer_ref();
+        tref.schedule_action_at(1, SystemTime::now(), |_| panic!("boom"))
+            .expect("schedule");
+        thread::sleep(Duration::from_millis(10));
+        let err = timer.shutdown().expect_err("expected join error");
+        assert_eq!(err, ThreadTimerError::JoinThread);
     }
 }

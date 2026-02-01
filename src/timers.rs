@@ -1,4 +1,4 @@
-use std::{fmt, hash::Hash};
+use std::{fmt, hash::Hash, time::SystemTime};
 
 /// A trait for state that can be triggered once.
 pub trait State {
@@ -7,47 +7,26 @@ pub trait State {
 
     /// A reference to the id associated with this state.
     fn id(&self) -> &Self::Id;
-    /// Trigger should be called by the timer implementation
+
+    /// Trigger is called by the timer implementation
     /// when the timeout has expired.
     fn trigger(self);
-}
-
-/// A concrete entry for an outstanding timeout using a wall-clock deadline.
-#[derive(Debug)]
-pub struct WallClockTimerEntry<I, O>
-where
-    I: Hash + Clone + Eq,
-    O: State<Id = I>,
-{
-    /// The wall clock deadline at which this should trigger.
-    pub deadline: std::time::SystemTime,
-    /// The information to store along with the timer.
-    pub state: O,
-}
-
-impl<I, O> WallClockTimerEntry<I, O>
-where
-    I: Hash + Clone + Eq,
-    O: State<Id = I>,
-{
-    /// A reference to the id associated with this entry.
-    pub fn id(&self) -> &I {
-        self.state.id()
-    }
 }
 
 /// A low-level wall-clock timer API.
 pub trait WallClockTimer {
     /// A type to uniquely identify any timeout to be scheduled or cancelled.
-    type Id: Hash + Clone + Eq;
-    /// The type of state to keep for oneshot timers.
+    type Id: Hash + Clone + Eq + Ord;
+    /// The type of state to keep for timers.
     type State: State<Id = Self::Id>;
+    /// Error type produced by timer operations.
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Schedule the `state` to be triggered at the given wall-clock `deadline`.
-    fn schedule_at(&mut self, deadline: std::time::SystemTime, state: Self::State);
+    fn schedule_at(&mut self, deadline: SystemTime, state: Self::State) -> Result<(), Self::Error>;
 
     /// Cancel the timer indicated by the unique `id`.
-    fn cancel(&mut self, id: &Self::Id);
+    fn cancel(&mut self, id: Self::Id) -> Result<(), Self::Error>;
 }
 
 /// A timeout state for a timer using a closure as the triggering action.
@@ -90,18 +69,19 @@ where
     I: Hash + Clone + Eq + fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "OneShotClosureState(id={:?}, action=<function>)",
-            self.id
-        )
+        write!(f, "ClosureState(id={:?}, action=<function>)", self.id)
     }
 }
 
 /// Convenience API for timers that use the closure state types.
 pub trait ClosureTimer: WallClockTimer {
     /// Schedule `action` to be executed at `deadline`.
-    fn schedule_action_at<F>(&mut self, id: Self::Id, deadline: std::time::SystemTime, action: F)
+    fn schedule_action_at<F>(
+        &mut self,
+        id: Self::Id,
+        deadline: std::time::SystemTime,
+        action: F,
+    ) -> Result<(), Self::Error>
     where
         F: FnOnce(Self::Id) + Send + 'static;
 }
@@ -111,7 +91,12 @@ where
     I: Hash + Clone + Eq,
     T: WallClockTimer<Id = I, State = ClosureState<I>>,
 {
-    fn schedule_action_at<F>(&mut self, id: Self::Id, deadline: std::time::SystemTime, action: F)
+    fn schedule_action_at<F>(
+        &mut self,
+        id: Self::Id,
+        deadline: std::time::SystemTime,
+        action: F,
+    ) -> Result<(), Self::Error>
     where
         F: FnOnce(Self::Id) + Send + 'static,
     {

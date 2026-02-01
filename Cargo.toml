@@ -5,4 +5,9 @@ edition = "2024"
 
 [dependencies]
 crossbeam-channel = "0.5"
-rustc-hash = "1"
+rustc-hash = "2"
+snafu = "0.8"
+log = "0.4"
+
+[dev-dependencies]
+simple_logger = "5"
