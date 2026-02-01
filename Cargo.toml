@@ -2,6 +2,14 @@
 name = "wallclock-timer"
 version = "0.1.0"
 edition = "2024"
+description = "Wall-clock-based timer utility."
+documentation = "https://docs.rs/wallclock-timer"
+homepage = "https://github.com/Bathtor/rust-wallclock-timer"
+repository = "https://github.com/Bathtor/rust-wallclock-timer"
+readme = "README.md"
+keywords = ["timer", "timeout"]
+categories = ["date-and-time"]
+license = "MIT"
 
 [package.metadata.docs.rs]
 all-features = true
