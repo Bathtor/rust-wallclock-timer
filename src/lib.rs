@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 //! Wall-clock-based timer utilities.
 //!
 //! This crate provides a timer that triggers actions at fixed wall-clock deadlines,
@@ -35,6 +36,10 @@
 //! Enable the `uuid` feature to use UUID ids and the UUID-based shorthand aliases:
 //! - [[thread_timer::UuidClosureTimer]]
 //! - [[thread_timer::UuidClosureTimerRef]]
+//!
+//! # Chrono feature
+//! Enable the `chrono` feature to schedule timers using `chrono::DateTime` via
+//! [[timers::chrono::ChronoTimer::schedule_at_datetime]].
 
 pub mod thread_timer;
 mod timers;

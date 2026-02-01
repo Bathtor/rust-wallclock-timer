@@ -3,12 +3,19 @@ name = "rust-wallclock-timer"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 crossbeam-channel = "0.5"
 rustc-hash = "2"
 snafu = "0.8"
 log = "0.4"
 uuid = { version = "1", optional = true, features = ["v4"] }
+chrono = { version = "0.4", optional = true, default-features = false, features = [
+    "clock",
+] }
 
 [dev-dependencies]
 simple_logger = "5"
@@ -16,3 +23,4 @@ simple_logger = "5"
 [features]
 default = ["uuid"]
 uuid = ["dep:uuid"]
+chrono = ["dep:chrono"]

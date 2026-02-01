@@ -1,5 +1,12 @@
 use std::{fmt, hash::Hash, time::SystemTime};
 
+/// Chrono-related scheduling helpers.
+///
+/// Allows scheduling directory with [[::chrono::DateTime]] instances.
+#[cfg(feature = "chrono")]
+#[cfg_attr(docsrs, doc(cfg(feature = "chrono")))]
+pub mod chrono;
+
 /// A trait for state that can be triggered once.
 pub trait State {
     /// The type of the unique id of the outstanding timeout.
@@ -103,3 +110,7 @@ where
         self.schedule_at(deadline, ClosureState::new(id, action))
     }
 }
+
+/// A shorthand for closure timers that use UUIDs as ids.
+#[cfg(feature = "uuid")]
+pub type UuidClosureTimerRef = crate::thread_timer::ClosureTimerRef<uuid::Uuid>;

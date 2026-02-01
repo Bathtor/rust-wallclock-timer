@@ -9,7 +9,7 @@ use crate::{
 };
 use crossbeam_channel as channel;
 use rustc_hash::FxHashMap;
-use snafu::{ResultExt, Snafu};
+use snafu::prelude::*;
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, hash_map},
@@ -77,10 +77,12 @@ pub type ClosureTimerRef<I> = TimerRef<I, ClosureState<I>>;
 
 /// A shorthand for a reference to a [[TimerWithThread]] with UUID closure actions.
 #[cfg(feature = "uuid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "uuid")))]
 pub type UuidClosureTimerRef = TimerRef<uuid::Uuid, ClosureState<uuid::Uuid>>;
 
 /// A shorthand for a timer that uses UUID closure actions.
 #[cfg(feature = "uuid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "uuid")))]
 pub type UuidClosureTimer = TimerWithThread<uuid::Uuid, ClosureState<uuid::Uuid>>;
 
 /// A reference to a thread timer.
