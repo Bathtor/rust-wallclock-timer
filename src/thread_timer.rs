@@ -72,8 +72,16 @@ where
     Stop,
 }
 
-/// A shorthand for a reference to a [[ThreadTimer]] with closure actions.
+/// A shorthand for a reference to a [[TimerWithThread]] with closure actions.
 pub type ClosureTimerRef<I> = TimerRef<I, ClosureState<I>>;
+
+/// A shorthand for a reference to a [[TimerWithThread]] with UUID closure actions.
+#[cfg(feature = "uuid")]
+pub type UuidClosureTimerRef = TimerRef<uuid::Uuid, ClosureState<uuid::Uuid>>;
+
+/// A shorthand for a timer that uses UUID closure actions.
+#[cfg(feature = "uuid")]
+pub type UuidClosureTimer = TimerWithThread<uuid::Uuid, ClosureState<uuid::Uuid>>;
 
 /// A reference to a thread timer.
 pub struct TimerRef<I, O>
@@ -134,7 +142,7 @@ pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
 /// A timer implementation that uses its own thread.
 ///
 /// This instance is essentially the owning handle.
-/// Non-owning references can be created with [[TimeWithThread::timer_ref()]] and are always cloneable.
+/// Non-owning references can be created with [[TimerWithThread::timer_ref]] and are always cloneable.
 pub struct TimerWithThread<I, O>
 where
     I: Hash + Clone + Eq + Ord,
@@ -218,6 +226,14 @@ where
             log::error!("Failed to send stop message: {}", err);
             SendMessageSnafu.build()
         })
+    }
+}
+
+#[cfg(feature = "uuid")]
+impl TimerWithThread<uuid::Uuid, ClosureState<uuid::Uuid>> {
+    /// Create a UUID-based timer using closure states.
+    pub fn for_uuid_closures(max_wait_time: Duration) -> Result<Self, ThreadTimerError> {
+        Self::new(max_wait_time)
     }
 }
 
